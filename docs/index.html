@@ -1,0 +1,171 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>地震モニター</title>
+<meta name="description" content="気象庁の震度・震源と緊急地震速報を、光る日本地図に。画面はすべて C++（WebAssembly）で描いています。">
+<style>
+html, body { margin: 0; height: 100%; background: #04070d; overflow: hidden; }
+#wrap { position: fixed; inset: 0; overflow: hidden; touch-action: none; cursor: grab; }
+#wrap.drag { cursor: grabbing; }
+canvas { position: absolute; left: 0; top: 0; width: 100%; height: 100%; transform-origin: 0 0; }
+#msg { position: fixed; left: 16px; top: 16px; color: #8d99ab; font: 14px system-ui, sans-serif; }
+</style>
+</head>
+<body>
+<div id="wrap"><canvas id="cv"></canvas></div>
+<div id="msg">読み込み中…</div>
+<script src="qm.js"></script>
+<script>
+// このページの仕事は 2 つだけ：(1) JSON を取って WASM に渡す (2) 指・マウスの動きを WASM に渡す。
+// 地図・震度・一覧・ボタン・緊急地震速報の帯など、画面はすべて WASM（C++）が描く。
+const JMA = 'https://www.jma.go.jp/bosai/quake/data/';
+const EEW_WS = 'wss://ws-api.wolfx.jp/jma_eew', EEW_JSON = 'https://api.wolfx.jp/jma_eew.json';
+const wrap = document.getElementById('wrap'), cv = document.getElementById('cv'), ctx = cv.getContext('2d');
+let M = null, W = 0, H = 0, img = null;
+let cssX = 0, cssY = 0, cssS = 1, settleTimer = 0;
+const pts = new Map();
+let drag = null, pinch = null, tap = null;
+
+// 文字列を WASM に渡す（呼んだあと解放する）
+function withStr(s, f) { const n = M.lengthBytesUTF8(s) + 1, p = M._malloc(n); M.stringToUTF8(s, p, n); try { return f(p); } finally { M._free(p); } }
+
+function size() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 1.5);
+  const w = Math.max(320, Math.round(innerWidth * dpr)), h = Math.max(240, Math.round(innerHeight * dpr));
+  const k = Math.min(1, Math.sqrt(1920 * 1100 / (w * h)));   // 描画は CPU なので、大きすぎる画面は縮める
+  W = Math.round(w * k); H = Math.round(h * k);
+  cv.width = W; cv.height = H;
+  img = ctx.createImageData(W, H);
+  M._qm_resize(W, H, W / innerWidth);   // 文字と線を、画面の上で同じくらいの大きさに
+}
+const pxScale = () => W / innerWidth;
+function applyCss() { cv.style.transform = `translate(${cssX}px, ${cssY}px) scale(${cssS})`; }
+function settle() {
+  if (M && (cssX || cssY || cssS !== 1)) {
+    const s = pxScale();
+    M._qm_pan(cssX * s / cssS, cssY * s / cssS);
+    M._qm_zoom(cssS, 0, 0);
+  }
+  cssX = cssY = 0; cssS = 1; cv.style.transform = '';
+}
+
+let last = performance.now();
+function frame(now) {
+  const dt = Math.min(0.1, (now - last) / 1000); last = now;
+  M._qm_tick(dt, Date.now() / 1000);
+  if (!pts.size && !settleTimer) {
+    const p = M._qm_render();
+    img.data.set(M.HEAPU8.subarray(p, p + W * H * 4));
+    ctx.putImageData(img, 0, 0);
+  }
+  requestAnimationFrame(frame);
+}
+
+// ---- データ ----
+async function pollList() {
+  try {
+    const r = await fetch(JMA + 'list.json', { cache: 'no-store' });
+    if (r.ok) { const t = await r.text(); withStr(t, p => M._qm_list(p)); }
+  } catch (e) { console.warn('list.json', e); }
+  fetchDetail();
+  setTimeout(pollList, 20000);
+}
+let detailBusy = false;
+async function fetchDetail() {
+  if (detailBusy) return;
+  const f = M.UTF8ToString(M._qm_wanted());
+  if (!f) return;
+  detailBusy = true;
+  try {
+    const r = await fetch(JMA + f);
+    if (r.ok) { const t = await r.text(); withStr(f, pf => withStr(t, pt => M._qm_detail(pf, pt))); }
+  } catch (e) { console.warn(f, e); }
+  detailBusy = false;
+}
+setInterval(() => { if (M) fetchDetail(); }, 1000);   // 一覧で別の地震を選んだときなど
+
+// 緊急地震速報：Wolfx の WebSocket。切れたら 5 秒後につなぎ直す
+function connectEew() {
+  let ws;
+  try { ws = new WebSocket(EEW_WS); } catch (e) { M._qm_eew_conn(2); setTimeout(connectEew, 5000); return; }
+  ws.onopen = () => M._qm_eew_conn(1);
+  ws.onmessage = (ev) => { if (typeof ev.data === 'string') withStr(ev.data, p => M._qm_eew(p)); };
+  ws.onclose = () => { M._qm_eew_conn(2); setTimeout(connectEew, 5000); };
+}
+
+// ---- 操作 ----
+function local(e) { const s = pxScale(); return [e.clientX * s, e.clientY * s]; }
+function twoFingers() {
+  const [a, b] = [...pts.values()];
+  return { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2, d: Math.max(1, Math.hypot(a.x - b.x, a.y - b.y)) };
+}
+function startPinch() { pinch = { ...twoFingers(), X: cssX, Y: cssY, S: cssS }; }
+wrap.addEventListener('pointerdown', (e) => {
+  if (settleTimer) { clearTimeout(settleTimer); settleTimer = 0; settle(); }
+  const [x, y] = local(e);
+  if (pts.size === 0 && M._qm_hit(x, y)) { tap = { x: e.clientX, y: e.clientY, ui: true }; return; }   // ボタン・一覧
+  pts.set(e.pointerId, { x: e.clientX, y: e.clientY });
+  wrap.setPointerCapture(e.pointerId); wrap.classList.add('drag');
+  if (pts.size === 1) { drag = { x: e.clientX, y: e.clientY }; tap = { x: e.clientX, y: e.clientY }; }
+  else { tap = null; if (pts.size === 2) startPinch(); }
+});
+wrap.addEventListener('pointermove', (e) => {
+  const [x, y] = local(e);
+  if (!pts.has(e.pointerId)) { if (e.pointerType === 'mouse') { M._qm_hover(x, y); wrap.style.cursor = M._qm_hit(x, y) ? 'pointer' : ''; } return; }
+  pts.set(e.pointerId, { x: e.clientX, y: e.clientY });
+  if (tap && Math.hypot(e.clientX - tap.x, e.clientY - tap.y) > 8) tap = null;
+  if (pinch && pts.size >= 2) {
+    const m = twoFingers(), k = m.d / pinch.d;
+    cssS = pinch.S * k; cssX = m.x - (pinch.x - pinch.X) * k; cssY = m.y - (pinch.y - pinch.Y) * k;
+    applyCss();
+  } else if (drag) {
+    cssX += e.clientX - drag.x; cssY += e.clientY - drag.y; drag = { x: e.clientX, y: e.clientY };
+    applyCss();
+  }
+});
+function endPointer(e) {
+  if (tap && tap.ui && !pts.size) {   // ボタン・一覧を押した
+    const [x, y] = local(e); M._qm_click(x, y); tap = null; return;
+  }
+  if (!pts.has(e.pointerId)) return;
+  pts.delete(e.pointerId);
+  if (pts.size === 1) { pinch = null; const [p] = [...pts.values()]; drag = { x: p.x, y: p.y }; }
+  else if (pts.size === 0) {
+    drag = pinch = null; wrap.classList.remove('drag');
+    const t = tap; tap = null;
+    settle();
+    if (t && e.type === 'pointerup') { const s = pxScale(); M._qm_hover(t.x * s, t.y * s); }   // タップで観測点の名前
+  } else startPinch();
+}
+wrap.addEventListener('pointerup', endPointer);
+wrap.addEventListener('pointercancel', endPointer);
+wrap.addEventListener('wheel', (e) => {
+  e.preventDefault();
+  const f = Math.exp(-e.deltaY * 0.0015);
+  cssX = e.clientX - (e.clientX - cssX) * f; cssY = e.clientY - (e.clientY - cssY) * f; cssS *= f;
+  applyCss();
+  clearTimeout(settleTimer);
+  settleTimer = setTimeout(() => { settleTimer = 0; settle(); }, 160);
+}, { passive: false });
+addEventListener('resize', () => { if (M) { size(); M._qm_fit(); } });
+
+(async () => {
+  const [bm, font, mod] = await Promise.all([
+    fetch('basemap.txt').then(r => r.text()), fetch('font.ttf').then(r => r.arrayBuffer()), createQM()]);
+  M = mod;
+  const fb = new Uint8Array(font), fp = M._malloc(fb.length); M.HEAPU8.set(fb, fp);
+  withStr(bm, p => M._qm_init(p, fp, fb.length));
+  M._free(fp);   // フォントは C++ 側がコピーして持つ
+  size(); M._qm_fit();
+  document.getElementById('msg').remove();
+  requestAnimationFrame(frame);
+  pollList();
+  // 直近の緊急地震速報（3 分より古ければ WASM 側で出さない）と、WebSocket
+  fetch(EEW_JSON, { cache: 'no-store' }).then(r => r.text()).then(t => withStr(t, p => M._qm_eew(p))).catch(() => {});
+  connectEew();
+})().catch(err => document.getElementById('msg').textContent = '読み込みに失敗: ' + err);
+</script>
+</body>
+</html>
